@@ -1,0 +1,144 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+# get libraries
+library('dplyr')    # for data wrangling
+library('MASS')     # for modelling negative binomial
+library('VGAM')     # for modelling zero-truncated negative binomial
+library('lme4')     # for mixed models
+```
+
+```{r}
+# import data 
+df <- read.csv('/Users/.../csv_files/merged.csv')
+# delete retweets and keep only unique tweets
+rt <- df[df$is_retweet == 'False', ]
+# change date to readable format
+rt$created_at <- as.POSIXct(rt$created_at)
+# define protest periods
+rt[(rt$created_at <= '2021/10/21') & (rt$created_at >= '2021/10/11'), 'period'] <- 'during protests'
+rt[(rt$created_at < '2021/10/11'), 'period'] <- 'pre protests'
+rt[(rt$created_at > '2021/10/21'), 'period'] <- 'post protests'
+# change to factor
+rt$best_result <- factor(rt$best_result, levels = c("joy", "anger", "sadness", "fear"))
+rt$period <- factor(rt$period, levels = c("pre protests", "during protests", "post protests"))
+# add predicted with model
+scrap <- read.csv('/Users/.../csv_files/opinion.csv')
+# concat datasets
+rt <- cbind(rt, scrap)
+# select factor 
+rt$best_result <- factor(rt$best_result, levels = c("joy", "anger", "sadness", "fear"))
+rt$period <- factor(rt$period, levels = c("pre protests", "during protests", "post protests"))
+# add label for opinion
+rt$opinion <- apply(rt[, c('X0', 'X1')], 1, function (x) which.max(x) - 1)
+rt$X0 <- NULL; rt$X1 <- NULL; rt$X <- NULL
+# change followers_count when log transformed to avoid -inf 
+rt$followers_count_ <- rt$followers_count + 1
+# change to a more specific label for support 
+conv <- c('1' = 'neutral or against', '0' = 'support')
+rt$opinion <- conv[as.character(rt$opinion)]
+# define factor order 
+rt$opinion <- factor(rt$opinion, levels = c("neutral or against", "support"))
+# add ffratio
+rt$ffratio <- rt$following_count / (rt$followers_count + 1)
+# select only retweeted tweets for modelling 
+tr <- rt[rt$retweet_count > 0, ]
+# make sure character id is string 
+tr$author_id <- as.character(tr$author_id)
+```
+
+```{r}
+# check dispersion 
+var(tr$retweet_count) / mean(tr$retweet_count)
+```
+
+```{r}
+# fit model 
+mod_0 <- glmer.nb(retweet_count ~ best_result * period * opinion + hashtags + as.factor(type_1) + log(tweet_count) + log(followers_count_) + ffratio + mentions + (1|author_id),
+                 data = tr, 
+                 verbose = TRUE, 
+                 nb.control = glmerControl(
+                   optimizer = "bobyqa", 
+                   optCtrl = list(maxfun = 2e5)))
+```
+
+
+```{r}
+# create prediction dataframe for visualization 
+tmp <- tr %>% group_by(username) %>% summarise(value_tweets = max(tweet_count), value_foll = max(followers_count_))
+# create new dataframe used to predict values 
+new_db <-as.data.frame(t(
+  c('period' = 'during protests', 
+  'best_result' = 'anger',       
+  'opinion' = 'support',         
+  'hashtags' = median(tr$hashtags),                     
+  'type_1' = names(which.max(table(tr$type_1))),       
+  'tweet_count' = median(tmp$value_tweets),             
+  'followers_count_' = median(tmp$value_foll),          
+  'ffratio' = median(tr$ffratio),                       
+  'mentions' = median(tr$mentions))))                   
+# change variable typing and add levels to continue prediction 
+new_db$period <- factor(new_db$period, levels = levels(tr$period)) 
+new_db$best_result <- factor(new_db$best_result, levels = levels(tr$best_result))
+new_db$opinion <- factor(new_db$opinion, levels = levels(tr$opinion))
+# change variable type after changing to dataframe 
+new_db$tweet_count <- as.integer(new_db$tweet_count)
+new_db$hashtags <- as.integer(new_db$hashtags)
+new_db$followers_count_ <- as.numeric(new_db$followers_count_)
+new_db$mentions <- as.integer(new_db$mentions)
+new_db$ffratio <- as.numeric(new_db$ffratio)
+# add one random author id 
+new_db$author_id <- tr$author_id[2]
+# Adjust the number of columns
+pred_db <- data.frame(matrix(ncol = ncol(new_db), nrow = 0))  
+colnames(pred_db) <- colnames(new_db)
+# create a dataframe with prediction results 
+out <- NULL; r_to_add <- NULL; r_opinion <- NULL; r_period <- NULL; r_best_result <- NULL;
+# cycle through all possible scenarios 
+for (p in list(levels(new_db$period))[[1]]){
+  for (b in list(levels(new_db$best_result))[[1]]){
+    for (o in list(levels(new_db$opinion))[[1]]){
+      # change pre-made dataset to include new scenario 
+      new_db$period <- p
+      new_db$best_result <- b
+      new_db$opinion <- o
+      # also change to factor as that apparently also breaks 
+      new_db$period <- factor(new_db$period, levels = levels(tr$period))
+      new_db$best_result <- factor(new_db$best_result, levels = levels(tr$best_result))
+      new_db$opinion <- factor(new_db$opinion, levels = levels(tr$opinion))
+      # make and append prediction 
+      out <- c(out, predict(mod_test, new_db))
+      pred_db <- rbind(pred_db, new_db)
+      # out <- c(out, merTools::predictInterval(mod_test, new_db, n.sims = 1000))
+      # also append names so we know what did what 
+      r_to_add <- c(r_to_add, paste(p, b, o, collapse = ' '))
+      r_opinion <- c(r_opinion, o)
+      r_period <- c(r_period, p)
+      r_best_result <- c(r_best_result, b)
+    }
+  }
+}
+# change to dataframe 
+out <- as.data.frame(out)
+# add name columns
+out$names <- r_to_add
+out$opinion <- r_opinion
+out$period <- r_period
+out$best_result <- r_best_result
+```
+
+Prediction with confidence intervals 
+
+```{r}
+# merTools::predictInterval(mod_test, new_db, n.sims = 1000)
+# append whole dataset for complete prediction
+out_se <- predict(mod_test, rbind(tr[colnames(pred_db)], pred_db), allow.new.levels = TRUE, se.fit = TRUE, re.form = ~0)
+# obtain prediction 
+out$out_se <- out_se$fit[(nrow(tr) + 1):(nrow(tr) + nrow(pred_db))]
+# obtain standard errors 
+out$se <- out_se$se.fit[(nrow(tr) + 1):(nrow(tr) + nrow(pred_db))]
+```
+
